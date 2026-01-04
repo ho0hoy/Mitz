@@ -1,0 +1,582 @@
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
+
+import scanpy as sc
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import xgboost as xgb
+import torch
+import torch.nn as nn
+
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score, accuracy_score, roc_curve, confusion_matrix
+from sklearn.decomposition import PCA
+from sklearn.mixture import GaussianMixture
+from scipy.spatial.distance import cdist
+
+sns.set_style("whitegrid")
+plt.rcParams["figure.dpi"] = 120
+
+
+# =========================
+# Utils
+# =========================
+def ensure_float_matrix(A):
+    """
+    SHAP/XGBoost 입력 전에 무조건 float32 2D로 만든다.
+    - sparse -> dense
+    - object / string(U,S) / '[2.9e-1]' 같은 문자열도 전부 처리한다
+    """
+    import re
+
+    if hasattr(A, "toarray"):
+        A = A.toarray()
+    A = np.asarray(A)
+
+    if A.ndim == 1:
+        A = A.reshape(-1, 1)
+
+    if A.dtype.kind in ("U", "S"):
+        flat = A.astype(str)
+        flat = np.char.strip(flat)
+        flat = np.char.replace(flat, "[", "")
+        flat = np.char.replace(flat, "]", "")
+
+        def clean_one(s):
+            s = re.sub(r"[^0-9eE\+\-\.]", "", s)
+            return s if s != "" else "0"
+
+        flat2 = np.vectorize(clean_one, otypes=[str])(flat)
+        A = flat2.astype(np.float32)
+
+    elif A.dtype == object:
+        def to_float(v):
+            if v is None:
+                return 0.0
+            if isinstance(v, (list, tuple, np.ndarray)):
+                vv = np.asarray(v).ravel()
+                v = vv[0] if vv.size > 0 else 0.0
+            if isinstance(v, str):
+                s = v.strip().replace("[", "").replace("]", "")
+                s = re.sub(r"[^0-9eE\+\-\.]", "", s)
+                return float(s) if s != "" else 0.0
+            return float(v)
+
+        A = np.array([[to_float(v) for v in row] for row in A], dtype=np.float32)
+    else:
+        A = A.astype(np.float32, copy=False)
+
+    A = np.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+    return np.ascontiguousarray(A)
+
+
+def calculate_ensemble(score1, score2, method="rank_mean", weight=0.7):
+    def minmax(x):
+        x = np.asarray(x, dtype=np.float32)
+        return (x - x.min()) / (x.max() - x.min() + 1e-9)
+
+    s1, s2 = minmax(score1), minmax(score2)
+
+    if method == "rank_mean":
+        r1 = pd.Series(s1).rank(method="average").to_numpy() / len(s1)
+        r2 = pd.Series(s2).rank(method="average").to_numpy() / len(s2)
+        return ((r1 + r2) / 2.0).astype(np.float32)
+    elif method == "weighted":
+        return (weight * s1 + (1 - weight) * s2).astype(np.float32)
+    else:
+        return ((s1 + s2) / 2.0).astype(np.float32)
+
+
+def threshold_gmm_2comp(scores, seed=42, grid_size=2000):
+    """
+    GT 없이 cancer 점수 분포만으로 threshold를 만든다.
+    2-component GMM을 fit하고, 평균이 큰 성분을 hijacking으로 보고 posterior=0.5 경계를 threshold로 잡는다.
+    """
+    s = np.asarray(scores, dtype=np.float64).reshape(-1, 1)
+    gmm = GaussianMixture(n_components=2, random_state=seed, reg_covar=1e-6)
+    gmm.fit(s)
+
+    means = gmm.means_.ravel()
+    hijack_comp = int(np.argmax(means))
+
+    lo, hi = float(s.min()), float(s.max())
+    grid = np.linspace(lo, hi, grid_size).reshape(-1, 1)
+    post = gmm.predict_proba(grid)[:, hijack_comp]
+    thr = grid[np.argmin(np.abs(post - 0.5))][0]
+    return float(thr), gmm, hijack_comp
+
+
+# =========================
+# Triplet model
+# =========================
+class TripletNet(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 64), nn.BatchNorm1d(64), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(64, 32), nn.BatchNorm1d(32), nn.ReLU(),
+            nn.Linear(32, 16)
+        )
+
+    def forward(self, x):
+        return self.encoder(x)
+
+
+# =========================
+# XGBoost internal reference scoring
+# =========================
+def run_xgboost_internal(X, y, n_splits=5, seed=2026):
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+
+    cancer_mask = (y == 0)
+    cancer_scores_full = np.full(X.shape[0], np.nan, dtype=np.float32)
+
+    for train_idx, val_idx in skf.split(X, y):
+        X_tr, y_tr = X[train_idx], y[train_idx]
+        X_val, y_val = X[val_idx], y[val_idx]
+
+        model = xgb.XGBClassifier(
+            n_estimators=200, max_depth=3, learning_rate=0.1,
+            subsample=0.9, colsample_bytree=0.9,
+            eval_metric="logloss", verbosity=0
+        )
+        model.fit(X_tr, y_tr)
+
+        probs = model.predict_proba(X_val)[:, 1].astype(np.float32)  # P(T=1)
+        val_cancer = (y_val == 0)
+        cancer_scores_full[val_idx[val_cancer]] = probs[val_cancer]
+
+    rep_model = xgb.XGBClassifier(
+        n_estimators=200, max_depth=3, learning_rate=0.1,
+        subsample=0.9, colsample_bytree=0.9,
+        eval_metric="logloss", verbosity=0
+    )
+    rep_model.fit(X, y)
+
+    if np.isnan(cancer_scores_full[cancer_mask]).any():
+        fill_probs = rep_model.predict_proba(X[cancer_mask])[:, 1].astype(np.float32)
+        cancer_scores_full[cancer_mask] = np.where(
+            np.isnan(cancer_scores_full[cancer_mask]),
+            fill_probs,
+            cancer_scores_full[cancer_mask]
+        )
+
+    return cancer_scores_full[cancer_mask], rep_model
+
+
+# =========================
+# Triplet internal reference (NO log1p, NO StandardScaler, NO embedding L2-normalization)
+# =========================
+def run_triplet_internal_no_norm(X, y, epochs=50, batch_size=512, lr=5e-4, seed=42, clip_val=None):
+    """
+    이미 정규화된 입력을 전제로 한다.
+    - log1p 제거한다
+    - StandardScaler 제거한다
+    - embedding L2 normalize 제거한다
+    """
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    X = np.asarray(X, dtype=np.float32)
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if clip_val is not None:
+        X = np.clip(X, -clip_val, clip_val).astype(np.float32, copy=False)
+
+    X_tensor = torch.tensor(X, dtype=torch.float32, device=device)
+    y_tensor = torch.tensor(y, dtype=torch.long, device=device)
+
+    model = TripletNet(X.shape[1]).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    criterion = nn.TripletMarginLoss(margin=1.0)
+
+    model.train()
+    n = X.shape[0]
+    bsz = min(batch_size, n)
+
+    for ep in range(epochs):
+        optimizer.zero_grad(set_to_none=True)
+
+        idx = torch.randperm(n, device=device)[:bsz]
+        anchor = X_tensor[idx]
+        labels = y_tensor[idx]
+
+        positive = torch.empty_like(anchor)
+        negative = torch.empty_like(anchor)
+
+        for i in range(bsz):
+            lab = labels[i]
+            same = torch.where(y_tensor == lab)[0]
+            same = same[same != idx[i]]
+            diff = torch.where(y_tensor != lab)[0]
+
+            if len(same) > 0:
+                p_idx = same[torch.randint(len(same), (1,), device=device)]
+            else:
+                p_idx = idx[i].view(1)
+
+            if len(diff) > 0:
+                n_idx = diff[torch.randint(len(diff), (1,), device=device)]
+            else:
+                n_idx = idx[i].view(1)
+
+            positive[i] = X_tensor[p_idx]
+            negative[i] = X_tensor[n_idx]
+
+        out_a = model(anchor)
+        out_p = model(positive)
+        out_n = model(negative)
+        loss = criterion(out_a, out_p, out_n)
+
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"[Triplet] loss가 NaN/Inf로 터졌다. epoch={ep}에서 중단한다.")
+            break
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        optimizer.step()
+
+    model.eval()
+    with torch.no_grad():
+        embeddings = model(X_tensor).detach().cpu().numpy().astype(np.float32)
+
+    embeddings = np.nan_to_num(embeddings, nan=0.0, posinf=0.0, neginf=0.0)
+
+    t_center = np.mean(embeddings[y == 1], axis=0, keepdims=True)
+    cancer_emb = embeddings[y == 0]
+    dists = cdist(cancer_emb, t_center, metric="euclidean").ravel()
+    cancer_scores = (1.0 / (1.0 + dists)).astype(np.float32)
+
+    return embeddings, cancer_scores
+
+
+# =========================
+# Plot helpers (요청 반영)
+# =========================
+def plot_pca_umap_pred_gt_4plots(embeddings_all, y_internal, cancer_mask_idx, pred_binary, true_labels,
+                                seed=42, umap_n_neighbors=30, umap_min_dist=0.3):
+    """
+    PCA 2개( Pred / GT ) + UMAP 2개( Pred / GT ) = 총 4개
+    색: T-cell 파랑 / Non-hijacking 주황 / Hijacking 빨강 / Other 회색
+    """
+    order = ["T-cell", "Non-hijacking", "Hijacking", "Other"]
+    palette = {
+        "T-cell": "#1f77b4",
+        "Non-hijacking": "#f4c430",
+        "Hijacking": "#d62728",
+        "Other": "#7f7f7f",
+    }
+
+    pred_cat = np.array(["Other"] * len(y_internal), dtype=object)
+    pred_cat[y_internal == 1] = "T-cell"
+    pred_cat[cancer_mask_idx] = np.where(np.asarray(pred_binary).astype(int) == 1, "Hijacking", "Non-hijacking")
+
+    gt_cat = np.array(["Other"] * len(y_internal), dtype=object)
+    gt_cat[y_internal == 1] = "T-cell"
+    gt_cat[cancer_mask_idx] = np.where(np.asarray(true_labels).astype(int) == 1, "Hijacking", "Non-hijacking")
+
+    # --- PCA
+    pca2 = PCA(n_components=2, random_state=seed).fit_transform(embeddings_all)
+    df_pca = pd.DataFrame(pca2, columns=["PC1", "PC2"])
+    df_pca["Pred"] = pd.Categorical(pred_cat, categories=order, ordered=True)
+    df_pca["GT"] = pd.Categorical(gt_cat, categories=order, ordered=True)
+
+    fig, ax = plt.subplots(1, 2, figsize=(14, 6))
+    sns.scatterplot(
+        data=df_pca, x="PC1", y="PC2",
+        hue="Pred", hue_order=[c for c in order if c in set(pred_cat)],
+        palette=palette, s=22, alpha=0.75, edgecolor=None, ax=ax[0],
+    )
+    ax[0].set_title("Triplet PCA - Prediction")
+    ax[0].legend(title="Pred", loc="best")
+
+    sns.scatterplot(
+        data=df_pca, x="PC1", y="PC2",
+        hue="GT", hue_order=[c for c in order if c in set(gt_cat)],
+        palette=palette, s=22, alpha=0.75, edgecolor=None, ax=ax[1],
+    )
+    ax[1].set_title("Triplet PCA - Ground Truth")
+    ax[1].legend(title="GT", loc="best")
+
+    plt.tight_layout()
+    plt.show()
+
+    # --- UMAP
+    ad_embed = sc.AnnData(X=embeddings_all)
+    ad_embed.obs["Pred"] = pd.Categorical(pred_cat, categories=order, ordered=True)
+    ad_embed.obs["GT"] = pd.Categorical(gt_cat, categories=order, ordered=True)
+
+    sc.pp.neighbors(ad_embed, n_neighbors=umap_n_neighbors, metric="euclidean")
+    sc.tl.umap(ad_embed, min_dist=umap_min_dist, random_state=seed)
+
+    um = ad_embed.obsm["X_umap"]
+    df_um = pd.DataFrame(um, columns=["UMAP1", "UMAP2"])
+    df_um["Pred"] = ad_embed.obs["Pred"].to_numpy()
+    df_um["GT"] = ad_embed.obs["GT"].to_numpy()
+
+    fig, ax = plt.subplots(1, 2, figsize=(14, 6))
+    sns.scatterplot(
+        data=df_um, x="UMAP1", y="UMAP2",
+        hue="Pred", hue_order=[c for c in order if c in set(pred_cat)],
+        palette=palette, s=22, alpha=0.75, edgecolor=None, ax=ax[0],
+    )
+    ax[0].set_title("Triplet UMAP - Prediction")
+    ax[0].legend(title="Pred", loc="best")
+
+    sns.scatterplot(
+        data=df_um, x="UMAP1", y="UMAP2",
+        hue="GT", hue_order=[c for c in order if c in set(gt_cat)],
+        palette=palette, s=22, alpha=0.75, edgecolor=None, ax=ax[1],
+    )
+    ax[1].set_title("Triplet UMAP - Ground Truth")
+    ax[1].legend(title="GT", loc="best")
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_score_scatter_pred_color_gt_marker(xgb_scores, triplet_scores, pred_binary, true_labels,
+                                           title="Cancer: XGB vs Triplet (Pred=color, GT=O/X)"):
+    """
+    scatter plot:
+      - 색: Prediction(Non-hijacking 주황, Hijacking 빨강)
+      - 마커: Ground Truth (O=GT hijacking(1), X=GT non(0))
+    """
+    df = pd.DataFrame({
+        "XGB_Score": np.asarray(xgb_scores, dtype=np.float32),
+        "Triplet_Score": np.asarray(triplet_scores, dtype=np.float32),
+        "Pred": np.where(np.asarray(pred_binary).astype(int) == 1, "Hijacking", "Non-hijacking"),
+        "GT": np.asarray(true_labels).astype(int),
+    })
+
+    palette = {"Hijacking": "#d62728", "Non-hijacking": "#bdbdbd"}  # 빨강/주황
+    markers = {1: "o", 0: "X"}  # GT: hijack=O, non=X
+
+    plt.figure(figsize=(7.8, 6.6))
+    sns.scatterplot(
+        data=df,
+        x="XGB_Score", y="Triplet_Score",
+        hue="Pred", palette=palette,
+        style="GT", markers=markers,
+        s=55, alpha=0.8, edgecolor=None
+    )
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
+
+
+# =========================
+# Minimal invitro runner (GT는 평가만, threshold는 GT 없이 GMM)
+# =========================
+def run_mitz_minimal_invitro(
+    adata,
+    target_column,
+    donor_labels,
+    recipient_labels,
+    gt_column,
+    pos_label,
+    ensemble_method="rank_mean",
+    triplet_epochs=100,
+    umap_n_neighbors=30,
+    umap_min_dist=0.3,
+    seed=42,
+):
+    # --- mt genes only
+    mito_mask = adata.var_names.str.startswith("MT-") | adata.var_names.str.startswith("mt-")
+    mito_genes = adata.var_names[mito_mask]
+    print(f"[1] 미토콘드리아 유전자 {len(mito_genes)}개만 사용한다.")
+
+    X = adata[:, mito_genes].X
+    X = ensure_float_matrix(X)
+
+    # --- internal labels & mask
+    is_t = adata.obs[target_column].isin(donor_labels).to_numpy()
+    is_cancer = adata.obs[target_column].isin(recipient_labels).to_numpy()
+    mask = is_t | is_cancer
+
+    X_data = ensure_float_matrix(X[mask])
+    y_internal = is_t[mask].astype(int)  # T=1, Cancer=0
+
+    print(f"[2] Reference T-cells={y_internal.sum()} / Target Cancer={(y_internal==0).sum()} 를 사용한다.")
+
+    # --- models
+    print("[3] XGBoost + Triplet을 실행한다.")
+    xgb_scores, xgb_model = run_xgboost_internal(X_data, y_internal, seed=seed)
+    embeddings_all, triplet_scores = run_triplet_internal_no_norm(
+        X_data, y_internal, epochs=triplet_epochs, seed=seed, clip_val=None
+    )
+
+    ens_scores = calculate_ensemble(xgb_scores, triplet_scores, method=ensemble_method)
+
+    # --- cancer indices
+    cancer_full_idx = np.where(is_cancer)[0]       # full adata indices
+    cancer_mask_idx = np.where(y_internal == 0)[0] # masked indices (within X_data)
+
+    # =========================
+    # threshold: GT 없이 GMM으로 만든다
+    # =========================
+    thr_ens, gmm, hij_comp = threshold_gmm_2comp(ens_scores, seed=seed)
+    pred_binary = (ens_scores >= thr_ens).astype(int)  # 1=hijacking, 0=non
+
+    # =========================
+    # 평가: GT는 여기서만 쓴다(모델/threshold에는 영향 없음)
+    # =========================
+    true_labels = (adata.obs.iloc[cancer_full_idx][gt_column].to_numpy() == pos_label).astype(int)
+
+    auc = roc_auc_score(true_labels, ens_scores) if len(np.unique(true_labels)) > 1 else np.nan
+    acc = accuracy_score(true_labels, pred_binary) if len(true_labels) > 0 else np.nan
+    cm = confusion_matrix(true_labels, pred_binary) if len(true_labels) > 0 else None
+
+    print("\n(1) invitro 성능을 출력한다.")
+    print(f"   - Threshold(Ensemble) = {thr_ens:.4f} (GMM, GT 미사용)")
+    print(f"   - Accuracy = {acc:.4f}" if not np.isnan(acc) else "   - Accuracy 계산 불가한다.")
+    print(f"   - ROC AUC  = {auc:.4f}" if not np.isnan(auc) else "   - ROC AUC 계산 불가한다(단일 클래스).")
+
+    # --- ROC/CM plot
+    fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+
+    if not np.isnan(auc):
+        fpr, tpr, _ = roc_curve(true_labels, ens_scores)
+        ax[0].plot(fpr, tpr, lw=2, label=f"AUC={auc:.3f}")
+        ax[0].plot([0, 1], [0, 1], "k--", lw=1)
+        ax[0].set_title("ROC Curve (Ensemble)")
+        ax[0].set_xlabel("FPR")
+        ax[0].set_ylabel("TPR")
+        ax[0].legend()
+    else:
+        ax[0].text(0.5, 0.5, "ROC/AUC 불가(단일 클래스)", ha="center", va="center")
+        ax[0].set_axis_off()
+
+    if cm is not None:
+        sns.heatmap(
+            cm, annot=True, fmt="d", cmap="Blues", ax=ax[1],
+            xticklabels=["Pred:Non", "Pred:Hijack"],
+            yticklabels=["True:Non", "True:Hijack"]
+        )
+        ax[1].set_title("Confusion Matrix")
+    else:
+        ax[1].text(0.5, 0.5, "CM 불가", ha="center", va="center")
+        ax[1].set_axis_off()
+
+    plt.tight_layout()
+    plt.show()
+
+    # =========================
+    # (추가) scatter plot: Pred=색, GT=O/X
+    # =========================
+    print("\n(추가) scatter: Pred는 색, GT는 O/X 마커로 그린다.")
+    plot_score_scatter_pred_color_gt_marker(
+        xgb_scores=xgb_scores,
+        triplet_scores=triplet_scores,
+        pred_binary=pred_binary,
+        true_labels=true_labels,
+        title="Cancer cells: XGB vs Triplet (Pred=color, GT=O/X)",
+    )
+
+    # =========================
+    # (2) XGBoost SHAP: pred_contribs로 안정적으로 계산한다
+    # =========================
+    print("\n(2) XGBoost SHAP + Tree를 그린다.")
+    try:
+        import shap
+
+        X_cancer = X_data[cancer_mask_idx]
+        n_sample = min(500, X_cancer.shape[0])
+        if n_sample < X_cancer.shape[0]:
+            rng = np.random.default_rng(seed)
+            sel = rng.choice(X_cancer.shape[0], n_sample, replace=False)
+            X_shap = X_cancer[sel]
+        else:
+            X_shap = X_cancer
+
+        X_shap = ensure_float_matrix(X_shap)
+
+        booster = xgb_model.get_booster()
+        dmat = xgb.DMatrix(X_shap, feature_names=list(mito_genes))
+        contrib = booster.predict(dmat, pred_contribs=True)  # (n, n_feat+1)
+        shap_values = contrib[:, :-1]  # bias term 제거한다
+
+        plt.figure(figsize=(10, 6))
+        shap.summary_plot(shap_values, X_shap, feature_names=list(mito_genes), show=False)
+        plt.title("SHAP Summary (XGBoost) - Cancer cells")
+        plt.tight_layout()
+        plt.show()
+
+    except Exception as e:
+        print(f"   SHAP 실패한다: {e}")
+
+    try:
+        plt.figure(figsize=(22, 10))
+        xgb.plot_tree(xgb_model, num_trees=0, rankdir="LR")
+        plt.title("XGBoost Tree #0")
+        plt.show()
+    except Exception as e:
+        print(f"   Tree plot 실패한다(대개 graphviz 문제): {e}")
+
+    # =========================
+    # (3) PCA/UMAP: Pred/GT 각각 그려서 총 4개
+    # =========================
+    print("\n(3) PCA/UMAP을 Pred/GT로 나눠서 총 4개 플랏을 그린다.")
+    plot_pca_umap_pred_gt_4plots(
+        embeddings_all=embeddings_all,
+        y_internal=y_internal,
+        cancer_mask_idx=cancer_mask_idx,
+        pred_binary=pred_binary,
+        true_labels=true_labels,
+        seed=seed,
+        umap_n_neighbors=umap_n_neighbors,
+        umap_min_dist=umap_min_dist,
+    )
+
+    return {
+        "xgb_model": xgb_model,
+        "mito_genes": list(mito_genes),
+        "thresholds": {"ensemble_gmm": thr_ens},
+        "metrics": {"auc": auc, "acc": acc, "confusion_matrix": cm},
+        "scores": {
+            "xgb_scores_cancer": xgb_scores,
+            "triplet_scores_cancer": triplet_scores,
+            "ensemble_scores_cancer": ens_scores,
+            "true_labels_cancer_eval_only": true_labels,
+            "pred_binary_cancer": pred_binary,
+        },
+        "embeddings_mask_all": embeddings_all,
+        "mask": mask,
+        "y_internal": y_internal,
+    }
+
+
+# =========================
+# Execution
+# =========================
+data_path = "/Users/jhy/Desktop/UGRP/data/bench1_scRNAseq.h5ad"
+
+target_column = "label"
+gt_column = "label"
+pos_label = "CC_cancer_cell"
+
+donor_labels = ["MC_T_cell"]
+recipient_labels = ["CC_cancer_cell", "MC_cancer_cell"]
+
+print(">>> 데이터 로드한다.")
+adata = sc.read_h5ad(data_path)
+print(f"   Loaded: {adata.n_obs} cells, {adata.n_vars} genes")
+
+out = run_mitz_minimal_invitro(
+    adata=adata,
+    target_column=target_column,
+    donor_labels=donor_labels,
+    recipient_labels=recipient_labels,
+    gt_column=gt_column,
+    pos_label=pos_label,
+    ensemble_method="rank_mean",
+    triplet_epochs=100,
+    umap_n_neighbors=30,
+    umap_min_dist=0.3,
+    seed=42,
+)
+
+print(">>> 끝난다.")
